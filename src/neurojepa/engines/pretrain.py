@@ -178,22 +178,25 @@ def train_one_epoch(
         else:
             loss.backward()
             grad_norm = _current_grad_norm(trainable_params)
-            # A finite loss can still yield a non-finite gradient: at init an
-            # inf gradient appears (likely a near-zero-variance LayerNorm
-            # backward on background-heavy patches) and clip_grad_norm_ can't
-            # fix it (max_norm/inf -> 0, then 0*inf -> NaN). Zero only the
-            # non-finite grad *elements* and keep the finite ones, so the step
-            # still makes progress and the model escapes the bad-init region.
-            # (Skipping the whole step instead stalls forever at large batch,
-            # where no all-finite batch ever occurs.)
-            if not torch.isfinite(grad_norm):
+            if torch.isfinite(grad_norm):
+                # Normal path: standard global-norm clipping.
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+            else:
+                # Init blow-up: a finite loss yields huge/inf gradients on a few
+                # samples. norm-clip can't tame this (the fp32 sum-of-squares
+                # overflows to inf, so max_norm/inf -> 0 zeros the whole step and
+                # the model never moves). Kill nan/inf elements, then *value*-clip
+                # (element-wise, overflow-proof) so a bounded Adam step still
+                # happens every iteration and the model escapes init in a few
+                # steps -- critical under DDP, where one bad rank would otherwise
+                # zero the all-reduced step for everyone.
                 for p in trainable_params:
                     if p.grad is not None:
                         torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-                grad_norm = _current_grad_norm(trainable_params)
-                logger.warning(f"Sanitized non-finite grads (norm now {grad_norm.item():.3f})")
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_value_(trainable_params, grad_clip)
+                logger.warning("Init grad blow-up: nan_to_num + value-clip (bounded step).")
             optimizer.step()
 
         # Zero gradients immediately after step — set_to_none=True releases
