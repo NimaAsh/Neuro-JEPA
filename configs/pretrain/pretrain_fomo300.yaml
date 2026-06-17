@@ -18,12 +18,13 @@ data:
   train_csv_path: null      # unused in the wds path
   cache_dir: null           # unused in the wds path
   batch_size: 16            # per-GPU; vit_base over 2535 tokens fits comfortably
-  buffer_size: 8000         # wds sample shuffle buffer
-  prefetch_factor: 2        # x num_workers dense batches in /dev/shm; keep modest
-  image_dtype: float16      # dense volume dtype in shared memory (bf16 model casts it)
+  gpu_densify: true         # workers stream sparse arrays; scatter to dense on GPU
+  buffer_size: 1500         # wds sample shuffle buffer (sparse ~4MB ea; keep modest)
+  prefetch_factor: 6        # sparse payload is ~5x smaller, so prefetch deep to hide IO
+  image_dtype: float16      # only used when gpu_densify=false (CPU dense dtype)
   img_size: [208, 240, 208]
   patch_size: [16, 16, 16]
-  num_workers: 12
+  num_workers: 16           # 16 CPU/GPU on this cluster
   pin_mem: true
   foreground_threshold: 0.0
   min_foreground_fraction: 0.1

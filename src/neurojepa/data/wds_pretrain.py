@@ -9,12 +9,21 @@ Each shard sample stores a *sparse* brain volume:
   - ``img_mask.npy``     : uint8, bit-packed (MSB-first) brain-presence mask
   - ``meta.json``        : per-scan metadata (modality, source dataset, ...)
 
-We densify each sample back to a ``[C, D, H, W]`` float tensor (zeros outside
-the brain) and yield ``(image, modality)`` -- the exact tuple
-``PretrainDataset.__getitem__`` returns -- so the rest of the pipeline
-(``MaskCollator``, foreground-aware masking, the JEPA loss) is unchanged.
+Two data paths (selected by ``data.gpu_densify``):
 
-The densify / bit-unpack logic mirrors smri-fm ``src/data/mri_data.py``
+* **gpu_densify: true (default, fast)** -- workers yield the *compact sparse*
+  arrays (~4 MB/sample vs ~21 MB dense). ``SparseMaskCollator`` stacks them,
+  derives the foreground patch grid straight from the bit-packed brain mask
+  (no dense volume on the CPU), and runs the unchanged mask generators. The
+  engine scatters to a dense volume on the GPU (``gpu_densify_batch``). This
+  keeps the dataloader workers cheap (no unpack+scatter of a 10.4 M-voxel
+  float volume) and shrinks the shared-memory payload ~5x so ``prefetch`` /
+  ``num_workers`` can be raised to hide /data read latency -> smooth GPU util.
+
+* **gpu_densify: false (fallback)** -- workers densify on the CPU and yield a
+  dense ``[C, D, H, W]`` tensor (original behaviour).
+
+Densify / bit-unpack mirrors smri-fm ``src/data/mri_data.py``
 (``unpack_img_mask_batch`` / ``densify_sparse_image_batch``).
 """
 
@@ -30,9 +39,8 @@ from torch.utils.data import DataLoader, IterableDataset
 from neurojepa.masks.masking import MaskCollator
 
 # Modality string (from meta.json) -> integer flag. Unknown -> -1.
-# `modality` is currently unused by the JEPA pretraining loss, so a missing /
-# unknown value is harmless; it is plumbed through only to match the
-# (image, modality) sample contract used elsewhere in the codebase.
+# `modality` is currently unused by the JEPA pretraining loss; plumbed through
+# only to match the (image, modality) sample contract used elsewhere.
 # Covers the FOMO300 modality set (see metadata.json modality_counts).
 MOD_MAP = {
     "t1w": 0, "t1": 0, "t1c": 1, "t1ce": 1, "t1map": 2, "mp2rage": 3, "unit1": 4,
@@ -74,32 +82,69 @@ def _extract_sparse_sample(sample: dict) -> dict:
     }
 
 
+def _check_packed(packed_size: int, numel: int, shape) -> None:
+    expected = math.ceil(numel / 8)
+    if packed_size != expected:
+        raise ValueError(
+            f"packed img_mask has {packed_size} bytes, expected {expected} for "
+            f"image_shape {tuple(shape)}; check that data.img_size matches the shard geometry."
+        )
+
+
 def _densify(
     image_values: np.ndarray,
     packed_mask: np.ndarray,
     shape: Sequence[int],
     dtype: np.dtype = np.float16,
 ) -> np.ndarray:
-    """Reconstruct a dense ``shape`` volume from packed mask + in-brain values.
-
-    Defaults to float16: the dense volume is what gets moved through the
-    DataLoader's shared memory, and a 208x240x208 float32 batch is ~660 MB
-    (float16 halves it). The model runs under bf16 autocast, so float16 input
-    is cast cleanly; for an fp32 run set ``data.image_dtype: float32``.
-    """
+    """CPU densify (gpu_densify=false path). Reconstruct a dense ``shape`` volume."""
     shape = tuple(int(d) for d in shape)
     numel = int(math.prod(shape))
-    expected_packed = math.ceil(numel / 8)
-    if packed_mask.size != expected_packed:
-        raise ValueError(
-            f"packed img_mask has {packed_mask.size} bytes, expected {expected_packed} "
-            f"for image_shape {shape}; check that data.img_size matches the shard geometry."
-        )
+    _check_packed(packed_mask.size, numel, shape)
     # MSB-first unpacking matches smri-fm's `unpack_img_mask_batch` (shifts 7..0).
     flat_mask = np.unpackbits(packed_mask, count=numel, bitorder="big").astype(bool)
     dense = np.zeros(numel, dtype=dtype)
     dense[flat_mask] = image_values.astype(dtype)
     return dense.reshape(shape)
+
+
+def _foreground_from_packed(packed_mask: np.ndarray, shape, patch_size, min_fraction: float) -> np.ndarray:
+    """Per-patch foreground grid straight from the bit-packed brain mask.
+
+    Returns a bool array [nD, nH, nW] (True = patch has >= ``min_fraction`` brain
+    voxels). Equivalent to ``compute_foreground_patches`` but uses the exact
+    brain mask instead of an intensity threshold, and never builds a float volume.
+    """
+    shape = tuple(int(d) for d in shape)
+    D, H, W = shape
+    numel = D * H * W
+    _check_packed(packed_mask.size, numel, shape)
+    pD, pH, pW = (int(p) for p in patch_size)
+    bits = np.unpackbits(packed_mask, count=numel, bitorder="big").reshape(D, H, W)
+    nD, nH, nW = D // pD, H // pH, W // pW
+    # strided mean over each patch block == avg_pool3d(kernel=stride=patch)
+    frac = bits.reshape(nD, pD, nH, pH, nW, pW).mean(axis=(1, 3, 5), dtype=np.float32)
+    return frac >= min_fraction
+
+
+def gpu_densify_batch(payload: dict, device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Scatter a stacked sparse batch to a dense ``[B, 1, D, H, W]`` volume on GPU.
+
+    ``payload`` carries ``packed_mask`` [B, P] uint8 and ``image_values`` [N]
+    (the per-sample in-brain values concatenated in batch order). Mirrors
+    smri-fm ``densify_sparse_image_batch`` but on the GPU, off the dataloader.
+    """
+    shape = tuple(int(d) for d in payload["image_shape"])
+    D, H, W = shape
+    numel = D * H * W
+    packed = payload["packed_mask"].to(device, non_blocking=True)        # [B, P] uint8
+    values = payload["image_values"].to(device, non_blocking=True)       # [N]
+    B = packed.shape[0]
+    shifts = torch.arange(7, -1, -1, device=device, dtype=torch.uint8)   # MSB-first
+    bits = (packed.unsqueeze(-1).bitwise_right_shift(shifts) & 1).reshape(B, -1)[:, :numel].bool()
+    dense = torch.zeros((B, numel), dtype=dtype, device=device)
+    dense[bits] = values.to(dtype)
+    return dense.view(B, 1, D, H, W)
 
 
 def _modality_flag(meta: Any) -> int:
@@ -116,10 +161,11 @@ def _modality_flag(meta: Any) -> int:
 class FomoWdsPretrainDataset(IterableDataset):
     """Iterable dataset over sparse FOMO300 WebDataset shards.
 
-    Yields ``(image[C, D, H, W] float32, modality long)``. Shards are resampled
-    with replacement when ``shuffle=True`` (the standard WebDataset large-scale
-    SSL pattern), so the stream is effectively infinite and the epoch length is
-    controlled by ``optimization.ipe`` in the engine, not by the shard count.
+    When ``sparse=True`` yields ``(image_values[f16], packed_mask[u8], modality)``
+    (densified on the GPU later); otherwise yields a dense
+    ``(image[C, D, H, W], modality)``. Shards are resampled with replacement when
+    ``shuffle=True`` (standard WDS large-scale SSL), so the stream is effectively
+    infinite and the epoch length is set by ``optimization.ipe``, not shard count.
     """
 
     def __init__(
@@ -130,8 +176,9 @@ class FomoWdsPretrainDataset(IterableDataset):
         samples_per_epoch: int = 1,
         num_workers: int = 1,
         shuffle: bool = True,
-        buffer_size: int = 8000,
+        buffer_size: int = 1500,
         image_dtype: np.dtype = np.float16,
+        sparse: bool = True,
     ):
         super().__init__()
         self.url = url
@@ -142,16 +189,15 @@ class FomoWdsPretrainDataset(IterableDataset):
         self.shuffle = shuffle
         self.buffer_size = int(buffer_size)
         self.image_dtype = image_dtype
+        self.sparse = sparse
 
     def _per_worker(self) -> int:
         return max(1, self._samples_per_epoch // self._num_workers)
 
     def __len__(self) -> int:
-        # Number of samples drawn per epoch (PyTorch divides this by batch_size
-        # to report len(loader)). The resampled WDS stream is infinite, so we
-        # cap __iter__ to exactly this many per epoch -- matching __len__ avoids
-        # the IterableDataset length-mismatch warning and gives InfiniteLoader a
-        # clean per-epoch StopIteration to reset on.
+        # Samples drawn per epoch (DataLoader divides by batch_size for len()).
+        # Capping __iter__ to this many gives a clean per-epoch StopIteration and
+        # avoids the IterableDataset length-mismatch warning.
         return self._per_worker() * self._num_workers
 
     def _build_pipeline(self):
@@ -174,36 +220,91 @@ class FomoWdsPretrainDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         nw = worker_info.num_workers if worker_info is not None else 1
         per_worker = max(1, self._samples_per_epoch // nw)
+        numel = int(math.prod(self.img_size))
         count = 0
         for sample in self._build_pipeline():
             if count >= per_worker:
                 return
             try:
-                dense = _densify(sample["image_values"], sample["img_mask"], self.img_size, self.image_dtype)
+                values = np.ascontiguousarray(sample["image_values"], dtype=np.float16)
+                packed = np.ascontiguousarray(sample["img_mask"], dtype=np.uint8)
+                _check_packed(packed.size, numel, self.img_size)
+                modality = torch.tensor(_modality_flag(sample["meta"]), dtype=torch.long)
+                if self.sparse:
+                    out = (torch.from_numpy(values), torch.from_numpy(packed), modality)
+                else:
+                    dense = _densify(values, packed, self.img_size, self.image_dtype)
+                    image = torch.from_numpy(dense).unsqueeze(0)
+                    if self.in_chans > 1:
+                        image = image.repeat(self.in_chans, 1, 1, 1)
+                    out = (image, modality)
             except Exception as exn:  # noqa: BLE001 - skip corrupt samples, keep streaming
                 _warn_and_continue(exn)
                 continue
-            image = torch.from_numpy(dense).unsqueeze(0)  # [1, D, H, W]
-            if self.in_chans > 1:
-                image = image.repeat(self.in_chans, 1, 1, 1)
-            modality = torch.tensor(_modality_flag(sample["meta"]), dtype=torch.long)
-            yield image, modality
+            yield out
             count += 1
+
+
+class SparseMaskCollator(MaskCollator):
+    """MaskCollator variant for the sparse (GPU-densify) path.
+
+    Stacks the sparse arrays, derives the foreground patch grid from the
+    bit-packed brain mask (no dense volume on the CPU), runs the same mask
+    generators, and returns ``((sparse_payload, modality), masks_enc,
+    masks_pred, fg_flat)``. The engine densifies ``sparse_payload`` on the GPU.
+    """
+
+    def __init__(self, *args, image_shape, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.image_shape = tuple(int(d) for d in image_shape)
+
+    def __call__(self, batch):
+        batch_size = len(batch)
+        if batch_size == 0:
+            raise ValueError("Detect batch size of 0 in SparseMaskCollator")
+
+        values = torch.cat([b[0] for b in batch])                 # [sum_nonzero] f16
+        packed = torch.stack([b[1] for b in batch])               # [B, P] uint8
+        modality = torch.stack([b[2] for b in batch])             # [B]
+        payload = {
+            "__sparse__": True,
+            "image_values": values,
+            "packed_mask": packed,
+            "image_shape": self.image_shape,
+        }
+
+        fg_mask = None
+        if self.foreground_aware:
+            packed_np = packed.numpy()
+            fg = np.stack([
+                _foreground_from_packed(packed_np[i], self.image_shape, self.patch_size, self.min_foreground_fraction)
+                for i in range(batch_size)
+            ])
+            fg_mask = torch.from_numpy(fg)                        # [B, nD, nH, nW] bool
+
+        collated_masks_enc, collated_masks_pred = [], []
+        for mask_generator in self.mask_generators:
+            masks_enc, masks_pred = mask_generator(batch_size, foreground_mask=fg_mask)
+            collated_masks_enc.append(masks_enc)
+            collated_masks_pred.append(masks_pred)
+
+        fg_flat = fg_mask.flatten(1).float() if fg_mask is not None else None
+        return ((payload, modality), collated_masks_enc, collated_masks_pred, fg_flat)
 
 
 def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
     """Drop-in replacement for ``datasets.get_pretrain_dataloaders`` (WDS source).
 
     Selected from ``scripts/pretrain.py`` when ``cfg.data.loader == "wds"``.
-    Reuses the unchanged ``MaskCollator``; FOMO300 is already RAS-registered,
-    brain-masked and intensity-normalized, so no MONAI loading transforms are
-    applied (``augs`` is accepted for signature parity and ignored).
+    FOMO300 is already RAS-registered, brain-masked and intensity-normalized, so
+    no MONAI loading transforms are applied (``augs`` ignored).
     """
     img_size = tuple(cfg.model.img_size)
     patch_size = tuple(cfg.model.patch_size)
     foreground_aware = getattr(cfg.model, "foreground_aware", False)
+    gpu_densify = bool(cfg.data.get("gpu_densify", True))
 
-    mask_collator = MaskCollator(
+    mask_kwargs = dict(
         cfgs_mask=cfg.mask,
         crop_size=img_size,
         patch_size=patch_size,
@@ -211,11 +312,14 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
         foreground_threshold=cfg.data.get("foreground_threshold", 0.0),
         min_foreground_fraction=cfg.data.get("min_foreground_fraction", 0.1),
     )
+    mask_collator = (
+        SparseMaskCollator(image_shape=img_size, **mask_kwargs)
+        if gpu_densify
+        else MaskCollator(**mask_kwargs)
+    )
 
     num_workers = int(cfg.data.num_workers)
-    # One epoch = ipe optimizer steps * batch_size samples. Capping the stream
-    # to this many per epoch keeps len(loader) == ipe and silences the
-    # IterableDataset length warning.
+    # One epoch = ipe optimizer steps * batch_size samples.
     samples_per_epoch = int(cfg.optimization.ipe) * int(cfg.data.batch_size)
     image_dtype = np.dtype(cfg.data.get("image_dtype", "float16"))
     dataset = FomoWdsPretrainDataset(
@@ -225,8 +329,9 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
         samples_per_epoch=samples_per_epoch,
         num_workers=num_workers,
         shuffle=True,
-        buffer_size=cfg.data.get("buffer_size", 8000),
+        buffer_size=cfg.data.get("buffer_size", 1500),
         image_dtype=image_dtype,
+        sparse=gpu_densify,
     )
     loader_kwargs: dict[str, Any] = dict(
         batch_size=cfg.data.batch_size,
@@ -238,11 +343,10 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
         persistent_workers=num_workers > 0,
     )
     if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = cfg.data.get("prefetch_factor", 4)
+        loader_kwargs["prefetch_factor"] = cfg.data.get("prefetch_factor", 6)
 
     # Plain DataLoader over the IterableDataset: its sampler is an
     # _InfiniteConstantSampler (no set_epoch), which InfiniteLoader handles
-    # safely -- unlike wds.WebLoader, whose internals InfiniteLoader assumes a
-    # `.sampler` on.
+    # safely -- unlike wds.WebLoader.
     train_loader = DataLoader(dataset, **loader_kwargs)
     return train_loader, mask_collator

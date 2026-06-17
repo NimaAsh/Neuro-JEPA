@@ -115,12 +115,17 @@ def train_one_epoch(
         fg_map = batch_data[3] if len(batch_data) > 3 else None
         all_data, all_modality = all_packed_data[0], all_packed_data[1]
 
-        # if all data is not list, convert to list
-        if all_data is not None and not isinstance(all_data, list):
-            all_data = [all_data]
-
-        # Send data to device
-        data = [convert_to_tensor(d, track_meta=False).to(device, non_blocking=True) for d in all_data]   # (image input in first element)
+        # Sparse WDS path: workers ship the compact (packed_mask, values) payload
+        # and we scatter to a dense volume on the GPU here (off the dataloader).
+        if isinstance(all_data, dict) and all_data.get("__sparse__"):
+            from neurojepa.data.wds_pretrain import gpu_densify_batch
+            data = [gpu_densify_batch(all_data, device)]
+        else:
+            # if all data is not list, convert to list
+            if all_data is not None and not isinstance(all_data, list):
+                all_data = [all_data]
+            # Send data to device
+            data = [convert_to_tensor(d, track_meta=False).to(device, non_blocking=True) for d in all_data]   # (image input in first element)
         
         # convert metatensor to tensor
         masks_enc = [[m.to(device, non_blocking=True) for m in all_masks_enc]]

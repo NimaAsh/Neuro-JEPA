@@ -10,7 +10,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=96
+#SBATCH --cpus-per-task=128   # 16 CPU/GPU x 8 -> feeds num_workers=16 per rank
 #SBATCH --time=2-00:00:00
 #SBATCH --partition=main
 #SBATCH --account=training
