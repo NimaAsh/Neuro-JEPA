@@ -25,6 +25,7 @@ export MASTER_PORT=$((10000 + (${SLURM_JOB_ID:-0} % 50000)))
 export NCCL_DEBUG=WARN
 export NCCL_ASYNC_ERROR_HANDLING=1
 export PYTHONUNBUFFERED=1
+export WANDB_MODE=online   # stream to wandb (override a stale offline `wandb/settings`)
 
 # Repo + environment.
 REPO=${REPO:-$HOME/smri-proj/Neuro-JEPA}
