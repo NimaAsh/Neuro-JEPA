@@ -19,7 +19,8 @@ data:
   cache_dir: null           # unused in the wds path
   batch_size: 16            # per-GPU; vit_base over 2535 tokens fits comfortably
   buffer_size: 8000         # wds sample shuffle buffer
-  prefetch_factor: 4
+  prefetch_factor: 2        # x num_workers dense batches in /dev/shm; keep modest
+  image_dtype: float16      # dense volume dtype in shared memory (bf16 model casts it)
   img_size: [208, 240, 208]
   patch_size: [16, 16, 16]
   num_workers: 12

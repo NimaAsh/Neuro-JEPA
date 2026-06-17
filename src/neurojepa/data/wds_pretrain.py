@@ -74,8 +74,19 @@ def _extract_sparse_sample(sample: dict) -> dict:
     }
 
 
-def _densify(image_values: np.ndarray, packed_mask: np.ndarray, shape: Sequence[int]) -> np.ndarray:
-    """Reconstruct a dense ``shape`` volume from packed mask + in-brain values."""
+def _densify(
+    image_values: np.ndarray,
+    packed_mask: np.ndarray,
+    shape: Sequence[int],
+    dtype: np.dtype = np.float16,
+) -> np.ndarray:
+    """Reconstruct a dense ``shape`` volume from packed mask + in-brain values.
+
+    Defaults to float16: the dense volume is what gets moved through the
+    DataLoader's shared memory, and a 208x240x208 float32 batch is ~660 MB
+    (float16 halves it). The model runs under bf16 autocast, so float16 input
+    is cast cleanly; for an fp32 run set ``data.image_dtype: float32``.
+    """
     shape = tuple(int(d) for d in shape)
     numel = int(math.prod(shape))
     expected_packed = math.ceil(numel / 8)
@@ -86,8 +97,8 @@ def _densify(image_values: np.ndarray, packed_mask: np.ndarray, shape: Sequence[
         )
     # MSB-first unpacking matches smri-fm's `unpack_img_mask_batch` (shifts 7..0).
     flat_mask = np.unpackbits(packed_mask, count=numel, bitorder="big").astype(bool)
-    dense = np.zeros(numel, dtype=np.float32)
-    dense[flat_mask] = image_values.astype(np.float32)
+    dense = np.zeros(numel, dtype=dtype)
+    dense[flat_mask] = image_values.astype(dtype)
     return dense.reshape(shape)
 
 
@@ -120,6 +131,7 @@ class FomoWdsPretrainDataset(IterableDataset):
         num_workers: int = 1,
         shuffle: bool = True,
         buffer_size: int = 8000,
+        image_dtype: np.dtype = np.float16,
     ):
         super().__init__()
         self.url = url
@@ -129,6 +141,7 @@ class FomoWdsPretrainDataset(IterableDataset):
         self._num_workers = max(1, int(num_workers))
         self.shuffle = shuffle
         self.buffer_size = int(buffer_size)
+        self.image_dtype = image_dtype
 
     def _per_worker(self) -> int:
         return max(1, self._samples_per_epoch // self._num_workers)
@@ -166,7 +179,7 @@ class FomoWdsPretrainDataset(IterableDataset):
             if count >= per_worker:
                 return
             try:
-                dense = _densify(sample["image_values"], sample["img_mask"], self.img_size)
+                dense = _densify(sample["image_values"], sample["img_mask"], self.img_size, self.image_dtype)
             except Exception as exn:  # noqa: BLE001 - skip corrupt samples, keep streaming
                 _warn_and_continue(exn)
                 continue
@@ -204,6 +217,7 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
     # to this many per epoch keeps len(loader) == ipe and silences the
     # IterableDataset length warning.
     samples_per_epoch = int(cfg.optimization.ipe) * int(cfg.data.batch_size)
+    image_dtype = np.dtype(cfg.data.get("image_dtype", "float16"))
     dataset = FomoWdsPretrainDataset(
         url=cfg.data.train_url,
         img_size=img_size,
@@ -212,6 +226,7 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
         num_workers=num_workers,
         shuffle=True,
         buffer_size=cfg.data.get("buffer_size", 8000),
+        image_dtype=image_dtype,
     )
     loader_kwargs: dict[str, Any] = dict(
         batch_size=cfg.data.batch_size,
