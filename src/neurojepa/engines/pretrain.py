@@ -178,17 +178,20 @@ def train_one_epoch(
         else:
             loss.backward()
             grad_norm = _current_grad_norm(trainable_params)
-            # Guard: a finite loss can still produce a non-finite gradient
-            # (e.g. a 0*inf / 0/0 in some op's backward). Stepping on it would
-            # poison every weight via the optimizer, turning all later steps
-            # NaN. Skip the update (and the momentum update) instead.
+            # A finite loss can still yield a non-finite gradient: at init an
+            # inf gradient appears (likely a near-zero-variance LayerNorm
+            # backward on background-heavy patches) and clip_grad_norm_ can't
+            # fix it (max_norm/inf -> 0, then 0*inf -> NaN). Zero only the
+            # non-finite grad *elements* and keep the finite ones, so the step
+            # still makes progress and the model escapes the bad-init region.
+            # (Skipping the whole step instead stalls forever at large batch,
+            # where no all-finite batch ever occurs.)
             if not torch.isfinite(grad_norm):
-                logger.warning(f"Skipped a step with non-finite grad norm: {grad_norm.item()}")
-                optimizer.zero_grad(set_to_none=True)
-                del loss, z, h, s, data, masks_enc, masks_pred
-                if fg_map is not None:
-                    del fg_map
-                continue
+                for p in trainable_params:
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                grad_norm = _current_grad_norm(trainable_params)
+                logger.warning(f"Sanitized non-finite grads (norm now {grad_norm.item():.3f})")
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
             optimizer.step()
