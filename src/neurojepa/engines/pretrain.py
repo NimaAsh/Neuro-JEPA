@@ -267,6 +267,17 @@ def train_one_epoch(
                         log_dict["MoE Bias Update Rate"] = bias_update_rate
                 wandb_run.log(log_dict, step=global_step)
 
+                # Periodic input/masking visualization (rank 0). Wrapped so a
+                # viz error can never take down training.
+                viz_freq = int(getattr(cfg.log, "viz_freq", 0) or 0)
+                if viz_freq and (global_step % viz_freq == 0):
+                    try:
+                        from neurojepa.utils.viz import log_jepa_masking
+                        log_jepa_masking(wandb_run, data[0], masks_pred[0], cfg.model.patch_size,
+                                         global_step, tag="train")
+                    except Exception as _viz_e:  # noqa: BLE001
+                        logger.warning(f"viz logging failed (non-fatal): {_viz_e}")
+
             # Reset accumulators
             _loss_acc.zero_()
             _grad_norm_latest.zero_()

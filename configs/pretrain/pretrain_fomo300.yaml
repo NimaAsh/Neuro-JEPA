@@ -144,6 +144,7 @@ optimization:
 log:
   filename: "pretrain_fomo300"
   log_freq: 1
+  viz_freq: 250            # every N steps, log input slices + masked/target patches to wandb (0=off)
   output_dir: runs/pretrain_fomo300
 wandb:
   project: "fomo26"
