@@ -1,0 +1,157 @@
+# Neuro-JEPA pretraining on the FOMO300 sparse-WebDataset shards.
+#
+# Differences from pretrain_neurojepa_base.yaml:
+#   - data.loader: wds      -> use src/neurojepa/data/wds_pretrain.py (no MONAI cache)
+#   - data.train_url        -> the FOMO300 sparse shards (read-only, on /data)
+#   - img_size 208x240x208, patch 16 -> full-FOV brain at the FOMO300 geometry
+#     (208/16=13, 240/16=15, 208/16=13 -> 13*15*13 = 2535 patches; divisible,
+#      as compute_foreground_patches requires).
+#
+# The shards are owned by mihir.neal and group-writable -- read them in place,
+# do NOT write into that directory.
+data:
+  loader: "wds"
+  dataset_type: "3D-MRI"
+  # All FOMO300 train shards (mirror Mihir's 90/10: train 000000..001020).
+  # Point at your own readable copy/symlink if you prefer not to read in place.
+  train_url: /data/smri-datasets/FOMO300/shard.{000000..001020}.tar
+  train_csv_path: null      # unused in the wds path
+  cache_dir: null           # unused in the wds path
+  batch_size: 16            # per-GPU; vit_base over 2535 tokens fits comfortably
+  buffer_size: 8000         # wds sample shuffle buffer
+  prefetch_factor: 4
+  img_size: [208, 240, 208]
+  patch_size: [16, 16, 16]
+  num_workers: 12
+  pin_mem: true
+  foreground_threshold: 0.0
+  min_foreground_fraction: 0.1
+data_aug:
+  auto_augment: false
+loss:
+  loss_name: "l1"
+  loss_exp: 1.0
+  bg_weight: 0.1
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 32
+  total_mask_ratio: 0.75
+  spatial_scale:
+  - 0.0
+  - 0.2
+  depth_scale:
+  - 0.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 16
+  total_mask_ratio: 0.75
+  spatial_scale:
+  - 0.2
+  - 0.5
+  depth_scale:
+  - 0.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  num_blocks: 4
+  total_mask_ratio: 0.75
+  spatial_scale:
+  - 0.5
+  - 0.7
+  depth_scale:
+  - 0.0
+  - 1.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  load_checkpoint: false
+  load_path_checkpoint: runs/pretrain_fomo300/ckpt/latest.pt
+  save_path_checkpoint: runs/pretrain_fomo300/ckpt
+  read_checkpoint: null
+  save_checkpoint_freq: 5
+  seed: 42
+  use_sdpa: true
+  compile_model: true
+model:
+  model_name: "jepa"
+  backbone_name: vit_base
+  img_size: [208, 240, 208]
+  patch_size: [16, 16, 16]
+  in_chans: 1
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: false
+  use_mask_tokens: true
+  use_rope: true
+  use_silu: false
+  use_pred_silu: false
+  wide_silu: true
+  zero_init_mask_tokens: true
+  foreground_aware: true
+  use_moe: false
+  moe_params:
+    moe_type: "bias"
+    dim: 768
+    n_shared_experts: 2
+    n_routed_experts: 16
+    n_activated_experts: 6
+    moe_inter_dim: 384
+    score_func: softmax
+    route_scale: 4.0
+    bias_clip: 0.3
+    bias_update_rate: 1e-4
+    bias_update_rate_min: 1e-4
+    bias_update_rate_max: 1e-4
+    moe_layer_indices:
+    - 1
+    - 3
+    - 5
+    - 7
+    - 9
+    - 11
+optimization:
+  is_anneal: False
+  ema:
+  - 0.99925
+  - 0.99925
+  num_epochs: 100
+  final_lr: 0.000525
+  final_weight_decay: 0.04
+  # ipe = samples_per_epoch / (world_size * batch_size).
+  # FOMO300 train ~= 153000 samples; e.g. 8 GPUs * bs 16 -> 153000/128 ~= 1195.
+  # Adjust to YOUR (world_size, batch_size). Set -1 to use len(loader)==this ipe.
+  ipe: 1195
+  ipe_scale: 1.0
+  lr: 0.000525
+  start_lr: 0.0001
+  warmup: 10
+  weight_decay: 0.04
+  grad_clip: 1.0
+  mixed_precision: true
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-08
+log:
+  filename: "pretrain_fomo300"
+  log_freq: 1
+  output_dir: runs/pretrain_fomo300
+wandb:
+  project: "fomo26"
+  entity: "nimaashjaee-university-of-british-columbia"
+  wandb_enable: true
+
+# Keep cwd at the launch dir so the relative runs/ paths above resolve there,
+# and don't scatter Hydra outputs/ subdirs.
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false

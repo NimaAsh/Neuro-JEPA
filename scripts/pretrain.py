@@ -34,7 +34,13 @@ torch.backends.cudnn.benchmark = True
 def main(cfg):
     # Init distributed training
     world_size, rank = init_distributed_mode()
-    
+
+    # Ensure output / checkpoint dirs exist (create_logger opens a FileHandler
+    # directly and does not mkdir).
+    os.makedirs(cfg.log.output_dir, exist_ok=True)
+    if cfg.meta.get('save_path_checkpoint'):
+        os.makedirs(cfg.meta.save_path_checkpoint, exist_ok=True)
+
     # Create logger
     logger = create_logger(output_dir=cfg.log.output_dir, dist_rank=dist.get_rank(), name=cfg.log.filename)
     
@@ -74,8 +80,14 @@ def main(cfg):
     # Create model & dataloader
     if cfg.model.model_name == 'jepa':
         # Dataloader
-        imtrans = jepa3d_transforms(cfg, mode='train')
-        train_loader, mask_collator = get_pretrain_dataloaders(cfg, augs=imtrans)
+        if cfg.data.get('loader', 'monai') == 'wds':
+            # FOMO300 sparse WebDataset shards (no MONAI cache); see
+            # src/neurojepa/data/wds_pretrain.py.
+            from neurojepa.data.wds_pretrain import get_pretrain_dataloaders_wds
+            train_loader, mask_collator = get_pretrain_dataloaders_wds(cfg)
+        else:
+            imtrans = jepa3d_transforms(cfg, mode='train')
+            train_loader, mask_collator = get_pretrain_dataloaders(cfg, augs=imtrans)
         # Model
         model_cfg = set_config_vjepa(cfg, device)
         encoder, predictor = init_model(**model_cfg)
