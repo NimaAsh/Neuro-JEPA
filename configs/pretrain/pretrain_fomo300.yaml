@@ -15,6 +15,8 @@ data:
   # All FOMO300 train shards (mirror Mihir's 90/10: train 000000..001020).
   # Point at your own readable copy/symlink if you prefer not to read in place.
   train_url: /data/smri-datasets/FOMO300/shard.{000000..001020}.tar
+  val_url: /data/smri-datasets/FOMO300/shard.{001021..001134}.tar   # held-out shards, for viz only
+  val_batch_size: 4
   train_csv_path: null      # unused in the wds path
   cache_dir: null           # unused in the wds path
   batch_size: 16            # per-GPU; vit_base over 2535 tokens fits comfortably

@@ -350,3 +350,54 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
     # safely -- unlike wds.WebLoader.
     train_loader = DataLoader(dataset, **loader_kwargs)
     return train_loader, mask_collator
+
+
+def make_val_loader_wds(cfg: Any):
+    """Small held-out loader for periodic viz (``data.val_url``); None if unset.
+
+    Single-process (num_workers=0) and tiny batch -- it's only sampled every
+    ``log.viz_freq`` steps on rank 0, so it must not compete with the train
+    loader for CPU/IO.
+    """
+    val_url = cfg.data.get("val_url", None)
+    if not val_url:
+        return None
+
+    img_size = tuple(cfg.model.img_size)
+    patch_size = tuple(cfg.model.patch_size)
+    foreground_aware = getattr(cfg.model, "foreground_aware", False)
+    gpu_densify = bool(cfg.data.get("gpu_densify", True))
+    batch_size = int(cfg.data.get("val_batch_size", 4))
+
+    mask_kwargs = dict(
+        cfgs_mask=cfg.mask,
+        crop_size=img_size,
+        patch_size=patch_size,
+        foreground_aware=foreground_aware,
+        foreground_threshold=cfg.data.get("foreground_threshold", 0.0),
+        min_foreground_fraction=cfg.data.get("min_foreground_fraction", 0.1),
+    )
+    collator = (
+        SparseMaskCollator(image_shape=img_size, **mask_kwargs)
+        if gpu_densify
+        else MaskCollator(**mask_kwargs)
+    )
+    dataset = FomoWdsPretrainDataset(
+        url=val_url,
+        img_size=img_size,
+        in_chans=cfg.model.in_chans,
+        samples_per_epoch=10 ** 9,  # effectively unbounded; we pull batches on demand
+        num_workers=1,
+        shuffle=True,
+        buffer_size=cfg.data.get("val_buffer_size", 256),
+        image_dtype=np.dtype(cfg.data.get("image_dtype", "float16")),
+        sparse=gpu_densify,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=cfg.data.pin_mem,
+        drop_last=True,
+    )

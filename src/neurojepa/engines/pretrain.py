@@ -16,6 +16,10 @@ from neurojepa.utils.misc import all_reduce_mean, save_checkpoint, MetricLogger,
 from neurojepa.loss.jepa_loss import loss_fn
 from neurojepa.utils.infinite_loader import InfiniteLoader
 
+# Lazily-built held-out iterator for periodic val visualization (rank 0 only).
+_VAL_VIZ_ITER = None
+_VAL_VIZ_INIT = False
+
 
 def train_one_epoch(
     cfg: Any,
@@ -267,16 +271,35 @@ def train_one_epoch(
                         log_dict["MoE Bias Update Rate"] = bias_update_rate
                 wandb_run.log(log_dict, step=global_step)
 
-                # Periodic input/masking visualization (rank 0). Wrapped so a
-                # viz error can never take down training.
+                # Periodic input / masking / latent-error visualization (rank 0).
+                # Wrapped so a viz error can never take down training.
                 viz_freq = int(getattr(cfg.log, "viz_freq", 0) or 0)
                 if viz_freq and (global_step % viz_freq == 0):
+                    pH, pW, pD = (int(p) for p in cfg.model.patch_size)
+                    vH, vW, vD = data[0].shape[2:]
+                    num_tokens = (vH // pH) * (vW // pW) * (vD // pD)
+                    # train: input + masking + latent |z-h| (z, h still in scope)
                     try:
-                        from neurojepa.utils.viz import log_jepa_masking
+                        from neurojepa.utils.viz import log_jepa_masking, per_patch_error
+                        train_err = per_patch_error(z, h, masks_pred, num_tokens)
                         log_jepa_masking(wandb_run, data[0], masks_pred[0], cfg.model.patch_size,
-                                         global_step, tag="train")
+                                         global_step, tag="train", err_tokens=train_err[0])
                     except Exception as _viz_e:  # noqa: BLE001
-                        logger.warning(f"viz logging failed (non-fatal): {_viz_e}")
+                        logger.warning(f"train viz failed (non-fatal): {_viz_e}")
+                    # held-out val: forward a fixed val batch and log the same
+                    try:
+                        global _VAL_VIZ_ITER, _VAL_VIZ_INIT
+                        if not _VAL_VIZ_INIT:
+                            from neurojepa.data.wds_pretrain import make_val_loader_wds
+                            _val_loader = make_val_loader_wds(cfg)
+                            _VAL_VIZ_ITER = InfiniteLoader(_val_loader) if _val_loader is not None else None
+                            _VAL_VIZ_INIT = True
+                        if _VAL_VIZ_ITER is not None:
+                            from neurojepa.utils.viz import log_jepa_val
+                            log_jepa_val(wandb_run, next(_VAL_VIZ_ITER), model, device,
+                                         cfg.model.patch_size, global_step, amp_dtype, use_amp, tag="val")
+                    except Exception as _vviz_e:  # noqa: BLE001
+                        logger.warning(f"val viz failed (non-fatal): {_vviz_e}")
 
             # Reset accumulators
             _loss_acc.zero_()
