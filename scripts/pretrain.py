@@ -53,6 +53,12 @@ def main(cfg):
     seed = cfg.meta.seed + dist.get_rank()
     init_seed(seed)
     logger.info(f"Seed is set to {seed}")
+
+    # Debug: locate the op whose backward returns NaN/Inf. Slow; use with a
+    # tiny ipe and num_workers=0 for a clean traceback.
+    if cfg.meta.get('detect_anomaly', False):
+        torch.autograd.set_detect_anomaly(True)
+        logger.warning("torch.autograd anomaly detection ENABLED (debug, slow).")
     
     # Output cfg settings
     if dist.get_rank() == 0:
