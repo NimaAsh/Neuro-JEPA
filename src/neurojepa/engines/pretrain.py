@@ -178,6 +178,17 @@ def train_one_epoch(
         else:
             loss.backward()
             grad_norm = _current_grad_norm(trainable_params)
+            # Guard: a finite loss can still produce a non-finite gradient
+            # (e.g. a 0*inf / 0/0 in some op's backward). Stepping on it would
+            # poison every weight via the optimizer, turning all later steps
+            # NaN. Skip the update (and the momentum update) instead.
+            if not torch.isfinite(grad_norm):
+                logger.warning(f"Skipped a step with non-finite grad norm: {grad_norm.item()}")
+                optimizer.zero_grad(set_to_none=True)
+                del loss, z, h, s, data, masks_enc, masks_pred
+                if fg_map is not None:
+                    del fg_map
+                continue
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
             optimizer.step()
@@ -355,8 +366,8 @@ def trainer(
                 model["predictor"], 
                 optimizer=optimizer, 
                 scaler=scaler, 
-                epoch=epoch, 
-                loss=train_stats['loss'],
+                epoch=epoch,
+                loss=train_stats.get('loss', float('nan')),
                 path=save_path,
                 global_step=global_step,
             )
