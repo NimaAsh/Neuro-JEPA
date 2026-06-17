@@ -26,11 +26,10 @@ export NCCL_DEBUG=WARN
 export NCCL_ASYNC_ERROR_HANDLING=1
 export PYTHONUNBUFFERED=1
 
-# Activate your environment (swap for enroot/pyxis or `uv run` as appropriate).
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate neurojepa_env
-
-REPO=${REPO:-$HOME/research/smri/Neuro-JEPA}
+# Repo + environment.
+REPO=${REPO:-$HOME/smri-proj/Neuro-JEPA}
+cd "$REPO"
+source "$REPO/.venv/bin/activate"
 export PYTHONPATH="$REPO/src"
 
 srun --cpu_bind=v --accel-bind=gn bash -c '
