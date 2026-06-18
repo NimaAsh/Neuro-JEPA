@@ -1,29 +1,31 @@
-# FOMO300 pretrain -- FAITHFUL to the original Neuro-JEPA recipe.
+# FOMO300 pretrain -- FAITHFUL to the original Neuro-JEPA recipe (geometry matched).
 #
-# Goal: reproduce pretrain_neurojepa_base.yaml as closely as the data + hardware
-# allow. The optimization block is copied VERBATIM from the original
-# (num_epochs 200, warmup 40, ipe 1600, lr 5.25e-4, ema 0.99925, wd 0.04,
-# grad_clip 1.0, betas, is_anneal false); the mask / model / loss blocks already
-# matched the original. With the wds loader cycling shards, ipe 1600 x 200 epochs
-# reproduces the original's exact 320k-step (main) LR schedule.
+# Goal: reproduce pretrain_neurojepa_base.yaml as closely as the data allows.
+# The optimization block is copied VERBATIM (num_epochs 200, warmup 40, ipe 1600,
+# lr 5.25e-4, ema 0.99925, wd 0.04, grad_clip 1.0, betas, is_anneal false); the
+# mask / model / loss blocks already matched. With the wds loader cycling shards,
+# ipe 1600 x 200 epochs reproduces the original's exact 320k-step LR schedule.
 #
-# Deviations from the original (data + hardware + one deliberate choice):
-#   * img_size 208x240x208, patch 16  (their 96x108x96 / patch 12 was a small,
-#     low-res FOV -> 576 tokens; ours is full-resolution FOMO300 -> 2535 tokens).
-#     DELIBERATE: we could GPU-downsample 208^3 -> 96x108x96 to match exactly
-#     (and unlock batch 48 + ~4.4x speedup), but we keep full resolution because
-#     it is the likely edge for the FOMO26 downstream goal. The paper's small
-#     geometry was their constraint, not a virtue.
-#   * batch_size 16 (per GPU) vs their 48 -- a consequence of the above: 2535
-#     tokens/sample will not fit 48.
-#     => effective batch 8*16=128 is smaller than the original's (48 x their
-#        GPU count). This is the one recipe knob we cannot match on 8 GPUs; close
-#        it later with grad-accumulation or more nodes if a probe says it matters.
-#   * data: ~153k single-modality (t1w-dominant) FOMO300 train shards vs their
-#     ~1.55M multi-modal (T1w+T2w+FLAIR) scans. ipe 1600 over 153k => ~1.34
-#     passes/epoch, ~268 passes over 200 epochs (heavy repetition -- watch val).
-#   * wds streaming + GPU-densify plumbing, and the engine's init NaN-grad
-#     sanitize+value-clip guard (needed for the full-FOV sequence at init).
+# Geometry IS matched: the 208x240x208 FOMO300 shards are GPU-downsampled (in
+# gpu_densify_batch, trilinear) to the original 96x108x96 / patch 12 -> 576
+# tokens. data.source_img_size = shard geometry (used to unpack the bit-packed
+# mask); model.img_size = post-downsample geometry that the model + masking +
+# foreground grid (8x9x8) all see. This also lets us match the original
+# batch_size 48 (576 tokens fit easily) -> effective batch 8*48=384.
+#
+# Remaining deviations (data, not tunable):
+#   * data: ~153k single-modality (t1w-dominant) FOMO300 vs their ~1.55M
+#     multi-modal (T1w+T2w+FLAIR). ipe 1600 over 153k => ~268 passes over 200
+#     epochs (heavy repetition -- watch val for memorization).
+#   * effective batch 384 (8x48) vs the original's (48 x their GPU count, larger);
+#     close with more nodes / grad-accum if a probe says it matters.
+#   * wds streaming + the engine's init NaN-grad sanitize+value-clip guard.
+#
+# PERF NOTE: at 576 tokens the model is ~4.4x cheaper per step, so this run is
+# DATALOADER-BOUND (per-sample 208^3 unpack + downsample dominates) -> GPU util
+# will sag below the full-res run's, though wall-clock is still far shorter. For
+# sustained high util, pre-resample the shards to 96x108x96 offline (removes the
+# 208^3 decode) and set data.source_img_size = model.img_size.
 data:
   loader: "wds"
   dataset_type: "3D-MRI"
@@ -32,13 +34,14 @@ data:
   val_batch_size: 4
   train_csv_path: null
   cache_dir: null
-  batch_size: 16            # per-GPU; capped by 2535 tokens/sample (original used 48 @ 576 tokens)
+  batch_size: 48            # original per-GPU batch; fits easily at 576 tokens
   gpu_densify: true
+  source_img_size: [208, 240, 208]   # shard storage geometry (unpack here, then downsample)
   buffer_size: 1500
   prefetch_factor: 6
   image_dtype: float16
-  img_size: [208, 240, 208]
-  patch_size: [16, 16, 16]
+  img_size: [96, 108, 96]   # post-downsample (model) geometry; cosmetic in the wds path
+  patch_size: [12, 12, 12]
   num_workers: 16
   pin_mem: true
   foreground_threshold: 0.0
@@ -97,8 +100,8 @@ meta:
 model:
   model_name: "jepa"
   backbone_name: vit_base
-  img_size: [208, 240, 208]
-  patch_size: [16, 16, 16]
+  img_size: [96, 108, 96]   # matches the original Neuro-JEPA geometry
+  patch_size: [12, 12, 12]
   in_chans: 1
   pred_depth: 12
   pred_embed_dim: 384

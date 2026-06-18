@@ -87,7 +87,7 @@ def _check_packed(packed_size: int, numel: int, shape) -> None:
     if packed_size != expected:
         raise ValueError(
             f"packed img_mask has {packed_size} bytes, expected {expected} for "
-            f"image_shape {tuple(shape)}; check that data.img_size matches the shard geometry."
+            f"image_shape {tuple(shape)}; check that data.source_img_size matches the shard geometry."
         )
 
 
@@ -127,12 +127,39 @@ def _foreground_from_packed(packed_mask: np.ndarray, shape, patch_size, min_frac
     return frac >= min_fraction
 
 
+def _foreground_grid_from_packed(
+    packed_mask: np.ndarray, source_shape, target_grid, min_fraction: float
+) -> np.ndarray:
+    """Per-patch foreground grid at an arbitrary ``target_grid`` (downsample path).
+
+    Unpacks the bit-packed brain mask at the *source* (shard) geometry and
+    average-pools the brain-presence fraction onto ``target_grid`` -- the model's
+    post-downsample patch grid, which need not divide the source evenly
+    (e.g. 208x240x208 -> 8x9x8). Returns a bool array [gD, gH, gW]
+    (True = patch has >= ``min_fraction`` brain). Used when source != target;
+    the cheap strided ``_foreground_from_packed`` is used when they match.
+    """
+    import torch.nn.functional as F
+
+    D, H, W = (int(s) for s in source_shape)
+    numel = D * H * W
+    _check_packed(packed_mask.size, numel, source_shape)
+    bits = np.unpackbits(packed_mask, count=numel, bitorder="big").reshape(D, H, W)
+    vol = torch.from_numpy(bits.astype(np.float32))[None, None]          # [1, 1, D, H, W]
+    frac = F.adaptive_avg_pool3d(vol, tuple(int(g) for g in target_grid))[0, 0]
+    return (frac >= min_fraction).numpy()
+
+
 def gpu_densify_batch(payload: dict, device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Scatter a stacked sparse batch to a dense ``[B, 1, D, H, W]`` volume on GPU.
 
     ``payload`` carries ``packed_mask`` [B, P] uint8 and ``image_values`` [N]
     (the per-sample in-brain values concatenated in batch order). Mirrors
     smri-fm ``densify_sparse_image_batch`` but on the GPU, off the dataloader.
+
+    If ``payload["target_shape"]`` differs from the (source) ``image_shape``, the
+    dense volume is trilinearly resampled to it -- e.g. to match the original
+    Neuro-JEPA 96x108x96 geometry from the 208x240x208 FOMO300 shards.
     """
     shape = tuple(int(d) for d in payload["image_shape"])
     D, H, W = shape
@@ -144,7 +171,16 @@ def gpu_densify_batch(payload: dict, device, dtype: torch.dtype = torch.float32)
     bits = (packed.unsqueeze(-1).bitwise_right_shift(shifts) & 1).reshape(B, -1)[:, :numel].bool()
     dense = torch.zeros((B, numel), dtype=dtype, device=device)
     dense[bits] = values.to(dtype)
-    return dense.view(B, 1, D, H, W)
+    dense = dense.view(B, 1, D, H, W)
+
+    target = payload.get("target_shape")
+    if target is not None:
+        target = tuple(int(t) for t in target)
+        if target != (D, H, W):
+            dense = torch.nn.functional.interpolate(
+                dense, size=target, mode="trilinear", align_corners=False
+            )
+    return dense
 
 
 def _modality_flag(meta: Any) -> int:
@@ -171,7 +207,8 @@ class FomoWdsPretrainDataset(IterableDataset):
     def __init__(
         self,
         url: "str | list[str]",
-        img_size: Sequence[int],
+        source_img_size: Sequence[int],
+        target_img_size: "Sequence[int] | None" = None,
         in_chans: int = 1,
         samples_per_epoch: int = 1,
         num_workers: int = 1,
@@ -182,7 +219,10 @@ class FomoWdsPretrainDataset(IterableDataset):
     ):
         super().__init__()
         self.url = url
-        self.img_size = tuple(int(d) for d in img_size)
+        # source = shard storage geometry (used to unpack/densify); target =
+        # post-downsample geometry the model sees (defaults to source = no resize).
+        self.source_img_size = tuple(int(d) for d in source_img_size)
+        self.target_img_size = tuple(int(d) for d in (target_img_size or source_img_size))
         self.in_chans = int(in_chans)
         self._samples_per_epoch = int(samples_per_epoch)
         self._num_workers = max(1, int(num_workers))
@@ -220,7 +260,7 @@ class FomoWdsPretrainDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         nw = worker_info.num_workers if worker_info is not None else 1
         per_worker = max(1, self._samples_per_epoch // nw)
-        numel = int(math.prod(self.img_size))
+        numel = int(math.prod(self.source_img_size))
         count = 0
         for sample in self._build_pipeline():
             if count >= per_worker:
@@ -228,13 +268,19 @@ class FomoWdsPretrainDataset(IterableDataset):
             try:
                 values = np.ascontiguousarray(sample["image_values"], dtype=np.float16)
                 packed = np.ascontiguousarray(sample["img_mask"], dtype=np.uint8)
-                _check_packed(packed.size, numel, self.img_size)
+                _check_packed(packed.size, numel, self.source_img_size)
                 modality = torch.tensor(_modality_flag(sample["meta"]), dtype=torch.long)
                 if self.sparse:
                     out = (torch.from_numpy(values), torch.from_numpy(packed), modality)
                 else:
-                    dense = _densify(values, packed, self.img_size, self.image_dtype)
-                    image = torch.from_numpy(dense).unsqueeze(0)
+                    dense = _densify(values, packed, self.source_img_size, self.image_dtype)
+                    image = torch.from_numpy(dense).unsqueeze(0)         # [1, D, H, W]
+                    if self.target_img_size != self.source_img_size:
+                        import torch.nn.functional as F
+                        image = F.interpolate(
+                            image[None].float(), size=self.target_img_size,
+                            mode="trilinear", align_corners=False,
+                        )[0].to(image.dtype)
                     if self.in_chans > 1:
                         image = image.repeat(self.in_chans, 1, 1, 1)
                     out = (image, modality)
@@ -254,9 +300,12 @@ class SparseMaskCollator(MaskCollator):
     masks_pred, fg_flat)``. The engine densifies ``sparse_payload`` on the GPU.
     """
 
-    def __init__(self, *args, image_shape, **kwargs):
+    def __init__(self, *args, source_shape, target_shape=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.image_shape = tuple(int(d) for d in image_shape)
+        # source = shard storage geometry (densify); target = post-downsample
+        # geometry the model sees (== crop_size). Foreground is at the model grid.
+        self.source_shape = tuple(int(d) for d in source_shape)
+        self.target_shape = tuple(int(d) for d in (target_shape or source_shape))
 
     def __call__(self, batch):
         batch_size = len(batch)
@@ -270,17 +319,28 @@ class SparseMaskCollator(MaskCollator):
             "__sparse__": True,
             "image_values": values,
             "packed_mask": packed,
-            "image_shape": self.image_shape,
+            "image_shape": self.source_shape,   # densify at shard geometry
+            "target_shape": self.target_shape,  # then resample to model geometry on GPU
         }
 
         fg_mask = None
         if self.foreground_aware:
             packed_np = packed.numpy()
-            fg = np.stack([
-                _foreground_from_packed(packed_np[i], self.image_shape, self.patch_size, self.min_foreground_fraction)
-                for i in range(batch_size)
-            ])
-            fg_mask = torch.from_numpy(fg)                        # [B, nD, nH, nW] bool
+            if self.source_shape == self.target_shape:
+                # No resize: cheap exact strided fraction at the patch grid.
+                fg = np.stack([
+                    _foreground_from_packed(packed_np[i], self.source_shape, self.patch_size, self.min_foreground_fraction)
+                    for i in range(batch_size)
+                ])
+            else:
+                # Downsample: pool the brain mask onto the model patch grid
+                # (target_shape // patch_size), which may not divide the source.
+                target_grid = tuple(t // p for t, p in zip(self.target_shape, self.patch_size))
+                fg = np.stack([
+                    _foreground_grid_from_packed(packed_np[i], self.source_shape, target_grid, self.min_foreground_fraction)
+                    for i in range(batch_size)
+                ])
+            fg_mask = torch.from_numpy(fg)                        # [B, gD, gH, gW] bool
 
         collated_masks_enc, collated_masks_pred = [], []
         for mask_generator in self.mask_generators:
@@ -299,7 +359,9 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
     FOMO300 is already RAS-registered, brain-masked and intensity-normalized, so
     no MONAI loading transforms are applied (``augs`` ignored).
     """
-    img_size = tuple(cfg.model.img_size)
+    img_size = tuple(cfg.model.img_size)               # model (post-downsample) geometry
+    # Shard storage geometry; defaults to model img_size (no resize / full-res path).
+    source_img_size = tuple(cfg.data.get("source_img_size", img_size))
     patch_size = tuple(cfg.model.patch_size)
     foreground_aware = getattr(cfg.model, "foreground_aware", False)
     gpu_densify = bool(cfg.data.get("gpu_densify", True))
@@ -313,7 +375,7 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
         min_foreground_fraction=cfg.data.get("min_foreground_fraction", 0.1),
     )
     mask_collator = (
-        SparseMaskCollator(image_shape=img_size, **mask_kwargs)
+        SparseMaskCollator(source_shape=source_img_size, target_shape=img_size, **mask_kwargs)
         if gpu_densify
         else MaskCollator(**mask_kwargs)
     )
@@ -324,7 +386,8 @@ def get_pretrain_dataloaders_wds(cfg: Any, augs: Any = None):
     image_dtype = np.dtype(cfg.data.get("image_dtype", "float16"))
     dataset = FomoWdsPretrainDataset(
         url=cfg.data.train_url,
-        img_size=img_size,
+        source_img_size=source_img_size,
+        target_img_size=img_size,
         in_chans=cfg.model.in_chans,
         samples_per_epoch=samples_per_epoch,
         num_workers=num_workers,
@@ -364,6 +427,7 @@ def make_val_loader_wds(cfg: Any):
         return None
 
     img_size = tuple(cfg.model.img_size)
+    source_img_size = tuple(cfg.data.get("source_img_size", img_size))
     patch_size = tuple(cfg.model.patch_size)
     foreground_aware = getattr(cfg.model, "foreground_aware", False)
     gpu_densify = bool(cfg.data.get("gpu_densify", True))
@@ -378,13 +442,14 @@ def make_val_loader_wds(cfg: Any):
         min_foreground_fraction=cfg.data.get("min_foreground_fraction", 0.1),
     )
     collator = (
-        SparseMaskCollator(image_shape=img_size, **mask_kwargs)
+        SparseMaskCollator(source_shape=source_img_size, target_shape=img_size, **mask_kwargs)
         if gpu_densify
         else MaskCollator(**mask_kwargs)
     )
     dataset = FomoWdsPretrainDataset(
         url=val_url,
-        img_size=img_size,
+        source_img_size=source_img_size,
+        target_img_size=img_size,
         in_chans=cfg.model.in_chans,
         samples_per_epoch=10 ** 9,  # effectively unbounded; we pull batches on demand
         num_workers=1,

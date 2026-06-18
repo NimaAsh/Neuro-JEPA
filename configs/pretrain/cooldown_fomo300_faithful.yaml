@@ -1,10 +1,12 @@
-# FOMO300 cooldown -- FAITHFUL to the original Neuro-JEPA recipe.
+# FOMO300 cooldown -- FAITHFUL to the original Neuro-JEPA recipe (geometry matched).
 #
 # Second half of the official recipe. Optimization block copied VERBATIM from
 # cooldown_neurojepa_base.yaml (num_epochs 40, is_anneal true, lr 5.25e-4 ->
 # final_lr 1e-6, warmup 0, ipe 1600). Loads the WEIGHTS from the faithful
 # 200-epoch main run (load_checkpoint + is_anneal loads weights and resets the
-# epoch/step counters). Same forced deviations as pretrain_fomo300_faithful.yaml.
+# epoch/step counters). Geometry matches the main run: 208^3 shards are
+# GPU-downsampled to 96x108x96 / patch 12, batch 48. See
+# pretrain_fomo300_faithful.yaml for the full deviation + perf notes.
 data:
   loader: "wds"
   dataset_type: "3D-MRI"
@@ -13,13 +15,14 @@ data:
   val_batch_size: 4
   train_csv_path: null
   cache_dir: null
-  batch_size: 16
+  batch_size: 48
   gpu_densify: true
+  source_img_size: [208, 240, 208]   # shard storage geometry (unpack here, then downsample)
   buffer_size: 1500
   prefetch_factor: 6
   image_dtype: float16
-  img_size: [208, 240, 208]
-  patch_size: [16, 16, 16]
+  img_size: [96, 108, 96]
+  patch_size: [12, 12, 12]
   num_workers: 16
   pin_mem: true
   foreground_threshold: 0.0
@@ -78,8 +81,8 @@ meta:
 model:
   model_name: "jepa"
   backbone_name: vit_base
-  img_size: [208, 240, 208]
-  patch_size: [16, 16, 16]
+  img_size: [96, 108, 96]   # matches the original Neuro-JEPA geometry
+  patch_size: [12, 12, 12]
   in_chans: 1
   pred_depth: 12
   pred_embed_dim: 384
