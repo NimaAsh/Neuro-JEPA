@@ -138,6 +138,11 @@ def _foreground_grid_from_packed(
     (e.g. 208x240x208 -> 8x9x8). Returns a bool array [gD, gH, gW]
     (True = patch has >= ``min_fraction`` brain). Used when source != target;
     the cheap strided ``_foreground_from_packed`` is used when they match.
+
+    Exact: pools the full source-resolution brain mask directly. (A gcd-strided
+    pre-pool is ~3x cheaper but shifts ~4% of boundary patches across the
+    threshold, so we keep the exact form -- the run is I/O- not CPU-bound anyway;
+    see PERF NOTE in the faithful config for the real fix.)
     """
     import torch.nn.functional as F
 
