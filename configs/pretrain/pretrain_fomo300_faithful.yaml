@@ -7,11 +7,15 @@
 # matched the original. With the wds loader cycling shards, ipe 1600 x 200 epochs
 # reproduces the original's exact 320k-step (main) LR schedule.
 #
-# UNAVOIDABLE deviations, all forced by "the data I already have" + 8xH100:
+# Deviations from the original (data + hardware + one deliberate choice):
 #   * img_size 208x240x208, patch 16  (their 96x108x96 / patch 12 was a small,
-#     low-res FOV; ours is the full-resolution FOMO300 geometry as stored ->
-#     2535 tokens/sample vs 576). We do NOT resample, per "use the data I have".
-#   * batch_size 16 (per GPU) vs their 48 -- 2535 tokens/sample will not fit 48.
+#     low-res FOV -> 576 tokens; ours is full-resolution FOMO300 -> 2535 tokens).
+#     DELIBERATE: we could GPU-downsample 208^3 -> 96x108x96 to match exactly
+#     (and unlock batch 48 + ~4.4x speedup), but we keep full resolution because
+#     it is the likely edge for the FOMO26 downstream goal. The paper's small
+#     geometry was their constraint, not a virtue.
+#   * batch_size 16 (per GPU) vs their 48 -- a consequence of the above: 2535
+#     tokens/sample will not fit 48.
 #     => effective batch 8*16=128 is smaller than the original's (48 x their
 #        GPU count). This is the one recipe knob we cannot match on 8 GPUs; close
 #        it later with grad-accumulation or more nodes if a probe says it matters.
