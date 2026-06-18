@@ -15,7 +15,7 @@ data:
   batch_size: 48
   gpu_densify: true
   buffer_size: 1500
-  prefetch_factor: 6
+  prefetch_factor: 4    # deep enough (GPU-bound on 96^3); lower than 6 to ease shm churn
   image_dtype: float16
   img_size: [96, 108, 96]
   patch_size: [12, 12, 12]

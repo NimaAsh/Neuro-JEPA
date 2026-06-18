@@ -20,6 +20,7 @@ from neurojepa.engines.pretrain import *
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.multiprocessing as torch_mp
 from torch.nn.parallel import DistributedDataParallel
 
 from monai.data import set_track_meta
@@ -29,6 +30,15 @@ set_track_meta(False)
 # accuracy impact for SSL pretraining).
 torch.set_float32_matmul_precision('high')
 torch.backends.cudnn.benchmark = True
+
+# DataLoader tensor sharing: the default 'file_descriptor' strategy keeps one
+# open FD per shared tensor. With many workers x deep prefetch x the WDS batch
+# (payload dict + 3 mask-generator tensor lists + fg_flat = many tensors/batch),
+# it exhausts FDs / races on the shm file after a few thousand steps -- a worker
+# then dies with "could not unlink the shared memory file ...", stalling that
+# rank until the NCCL watchdog times out the collective (the SIGABRT we hit).
+# 'file_system' shares via a managed shm file (one ref), robust to that.
+torch_mp.set_sharing_strategy("file_system")
 
 @hydra.main(version_base=None, config_path="../configs/pretrain")
 def main(cfg):

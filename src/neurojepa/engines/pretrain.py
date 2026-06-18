@@ -426,8 +426,8 @@ def trainer(
                     model["predictor"], 
                     optimizer=optimizer, 
                     scaler=scaler, 
-                    epoch=epoch, 
-                    loss=train_stats['loss'],
+                    epoch=epoch,
+                    loss=train_stats.get('loss', float('nan')),
                     path=save_path,
                     global_step=global_step,
                 )

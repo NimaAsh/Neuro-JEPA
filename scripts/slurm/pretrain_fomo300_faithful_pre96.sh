@@ -20,6 +20,10 @@ mkdir -p log
 : "${FOMO300_96_DIR:?set FOMO300_96_DIR to the dir you re-sharded into (scripts/slurm/reshard_fomo300_96.sh)}"
 export FOMO300_96_DIR
 
+# Raise the open-file limit: DataLoader shared-memory tensors consume FDs across
+# 8 ranks x 16 workers x prefetch (see set_sharing_strategy in scripts/pretrain.py).
+ulimit -n 1048576 2>/dev/null || ulimit -n "$(ulimit -Hn)"
+
 export MASTER_ADDR=$(hostname -s)
 export MASTER_PORT=$((10000 + (${SLURM_JOB_ID:-0} % 50000)))
 export NCCL_DEBUG=WARN

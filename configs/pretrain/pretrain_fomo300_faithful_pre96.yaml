@@ -26,7 +26,7 @@ data:
   # No source_img_size: shards are already 96^3, so source==target==model.img_size
   # (no downsample, cheap strided foreground).
   buffer_size: 1500
-  prefetch_factor: 6
+  prefetch_factor: 4    # deep enough (GPU-bound on 96^3); lower than 6 to ease shm churn
   image_dtype: float16
   img_size: [96, 108, 96]
   patch_size: [12, 12, 12]
