@@ -37,6 +37,11 @@ srun --cpu_bind=v --accel-bind=gn bash -c '
   export WORLD_SIZE=$SLURM_NTASKS
   export RANK=$SLURM_PROCID
   echo "NODE $SLURMD_NODENAME: RANK $RANK / $WORLD_SIZE"
+  # Clear OUR OWN stale /dev/shm torch_* files a prior job left on this node
+  # (file_system strategy leaks named shm files); they cause a cold-start unlink
+  # race. Safe: gpu:8 = whole-node alloc, runs before any rank is spawned, scoped
+  # to $USER, so it cannot touch another job/user.
+  find /dev/shm -maxdepth 1 -user "$USER" -name "torch_*" -delete 2>/dev/null || true
   python -m torch.distributed.run \
     --nproc_per_node "$SLURM_GPUS_ON_NODE" \
     --nnodes "$SLURM_NNODES" \
